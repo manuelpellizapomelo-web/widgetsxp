@@ -3,7 +3,6 @@ If you find this tool useful, you can support its development on [Ko-fi](https:/
 Widgets: your desktop, but make it 2001.
 Widgets puts the Windows XP look back on your screen with small, draggable widgets: an analog and digital clock, a calendar, a CPU/RAM/network monitor, a timer and stopwatch, and auto-saved notes.
 
-12 themes: Luna Blue, Silver, Olive, Bubblegum, Bondi Aqua, Grape, Tangerine, Cherry, Graphite, Royale Noir, Matrix and Vaporwave. You can also make your own with a simple JSON file.
 Accurate time: it can check the real time online, so your clock is always right.
 Game-friendly: it uses almost no CPU, and Ctrl+Alt+W hides everything instantly.
 Yours to arrange: change opacity, keep widgets always on top, and roll them up with a double-click.

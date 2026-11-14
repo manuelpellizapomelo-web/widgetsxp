@@ -3,27 +3,26 @@
 Run:       python main.py
 Controls:  drag a widget to move it | double-click its title bar to roll it up
            right-click for the menu | left-click the tray icon to hide/show all
-           Ctrl+Alt+W hides/shows every widget (handy while gaming)
+           Ctrl+Alt+W hides/shows every widget, Ctrl+Alt+G toggles click-through,
+           Ctrl+Alt+T switches to the next skin
 Data:      positions, notes and settings are stored in a small state.json in
-           your app-data folder. The only thing it ever asks the internet for is
-           the current time (NTP); turn that off in the menu if you prefer.
+           your app-data folder. The app never connects to the internet.
 """
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, QStandardPaths, QTimer
-from PySide6.QtGui import (QActionGroup, QColor, QIcon, QLinearGradient,
-                           QPainter, QPen, QPixmap)
+from PySide6.QtCore import QPoint, QStandardPaths, Qt, QTimer, QUrl
+from PySide6.QtGui import (QActionGroup, QColor, QDesktopServices, QIcon,
+                           QLinearGradient, QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from hotkey import HOTKEY_LABEL, install_hotkey
-from themes import load_themes
-from timesync import TimeSync
+import autostart
+from hotkey import PREFIX, install_hotkeys
+from themes import ensure_user_dir, load_themes
 from widgets import KIND_LABELS, KINDS
 
 
@@ -64,19 +63,17 @@ class Manager:
         self.app = app
         self.data_dir = data_dir
         self.state_path = data_dir / "state.json"
-        self.themes = load_themes(data_dir / "themes")
+        self.themes_dir = data_dir / "themes"
+        ensure_user_dir(self.themes_dir)
+        self.themes = load_themes(self.themes_dir)
         self.theme = self.themes["Luna Blue"]
         self.always_on_top = False
         self.opacity = 1.0
         self.clock24 = True
         self.week_monday = True
-        self.sync_time = True
-        self.time_offset = dt.timedelta(0)
-        self.time_ok: bool | None = None      # None = not tried yet
-        self.timesync = TimeSync(self._on_time_synced, app)
-        self.resync = QTimer(app)
-        self.resync.setInterval(60 * 60 * 1000)   # once an hour
-        self.resync.timeout.connect(self.timesync.start)
+        self.snap = True
+        self.locked = False
+        self.click_through = False
         self.visible = True
         self.widgets: list = []
         self.tray: QSystemTrayIcon | None = None
@@ -97,8 +94,9 @@ class Manager:
             self.theme = self.themes[state["theme"]]
         self.always_on_top = bool(state.get("always_on_top", False))
         self.clock24 = bool(state.get("clock24", True))
-        self.sync_time = bool(state.get("sync_time", True))
         self.week_monday = bool(state.get("week_monday", True))
+        self.snap = bool(state.get("snap", True))
+        self.locked = bool(state.get("locked", False))
         op = state.get("opacity", 1.0)
         self.opacity = op if isinstance(op, (int, float)) and 0.3 <= op <= 1.0 else 1.0
 
@@ -115,11 +113,17 @@ class Manager:
             if isinstance(it, dict):
                 self.add_widget(it.get("type", ""), it)
         self._loading = False
-        self.hotkey_cleanup = install_hotkey(self.app, self.toggle_visible)
+        self.hotkey_cleanup = install_hotkeys(
+            self.app, {"W": self.toggle_visible, "G": self.toggle_click_through,
+                       "T": self.next_theme})
         self._setup_tray()
         self._update_ticker()
-        self._apply_sync_setting()
         self.save()
+
+    def notify(self, title: str, text: str) -> None:
+        """Tray balloon (used by timers, which must be able to ring while hidden)."""
+        if self.tray is not None:
+            self.tray.showMessage(title, text, QSystemTrayIcon.Information, 6000)
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -175,6 +179,7 @@ class Manager:
     def remove(self, wd) -> None:
         if wd in self.widgets:
             self.widgets.remove(wd)
+        wd.on_close()
         wd.hide()
         wd.deleteLater()
         self._update_ticker()
@@ -186,12 +191,18 @@ class Manager:
     def _on_tick(self) -> None:
         self._tick += 1
         for wd in list(self.widgets):
-            if wd.tick_every and self._tick % wd.tick_every == 0:
+            if not wd.tick_every or self._tick % wd.tick_every:
+                continue
+            if self.visible or wd.keep_alive():
                 wd.on_tick(self._tick)
+        if not self.visible:
+            self._update_ticker()       # stop again as soon as no timer is running
 
     def _update_ticker(self) -> None:
-        """The ticker only runs while something is visible: zero wake-ups otherwise."""
-        want = self.visible and any(w.tick_every for w in self.widgets)
+        """The ticker only runs while something is visible (or a timer is running
+        and has to ring): zero wake-ups otherwise."""
+        want = any(w.tick_every and (self.visible or w.keep_alive())
+                   for w in self.widgets)
         if want and not self.ticker.isActive():
             self.ticker.start()
         elif not want and self.ticker.isActive():
@@ -209,6 +220,64 @@ class Manager:
     def toggle_visible(self) -> None:
         self.set_all_visible(not self.visible)
 
+    # ------------------------------------------------------- window helpers
+    def window_flags(self):
+        flags = Qt.FramelessWindowHint | Qt.Tool          # Tool = no taskbar button
+        if self.always_on_top:
+            flags |= Qt.WindowStaysOnTopHint
+        if self.click_through:
+            flags |= Qt.WindowTransparentForInput
+        return flags
+
+    def _reapply_flags(self) -> None:
+        for wd in self.widgets:
+            pos, was_visible = wd.pos(), wd.isVisible()
+            wd.setWindowFlags(self.window_flags())
+            wd.setWindowOpacity(self.opacity)
+            wd.move(pos)
+            if was_visible:
+                wd.show()
+
+    def snap_pos(self, wd, pos: QPoint) -> QPoint:
+        """Magnetic edges: snap to screen borders and to other widgets."""
+        if not self.snap:
+            return pos
+        thr = 14
+        w, h = wd.width(), wd.height()
+        center = QPoint(pos.x() + w // 2, pos.y() + h // 2)
+        geo = (self.app.screenAt(center) or self.app.primaryScreen()).availableGeometry()
+        x, y = pos.x(), pos.y()
+        if abs(x - geo.left()) < thr:
+            x = geo.left()
+        elif abs(x + w - (geo.right() + 1)) < thr:
+            x = geo.right() + 1 - w
+        if abs(y - geo.top()) < thr:
+            y = geo.top()
+        elif abs(y + h - (geo.bottom() + 1)) < thr:
+            y = geo.bottom() + 1 - h
+        for o in self.widgets:
+            if o is wd or not o.isVisible():
+                continue
+            og = o.geometry()
+            if y < og.bottom() + thr and y + h > og.top() - thr:
+                if abs(x - (og.right() + 1)) < thr:
+                    x = og.right() + 1
+                elif abs(x + w - og.left()) < thr:
+                    x = og.left() - w
+                elif abs(x - og.left()) < thr:
+                    x = og.left()
+            if x < og.right() + thr and x + w > og.left() - thr:
+                if abs(y - (og.bottom() + 1)) < thr:
+                    y = og.bottom() + 1
+                elif abs(y + h - og.top()) < thr:
+                    y = og.top() - h
+                elif abs(y - og.top()) < thr:
+                    y = og.top()
+        return QPoint(x, y)
+
+    def can_escape_click_through(self) -> bool:
+        return self.tray is not None or self.hotkey_cleanup is not None
+
     # ----------------------------------------------------------- settings
     def set_theme(self, name: str) -> None:
         if name in self.themes:
@@ -216,6 +285,40 @@ class Manager:
             for wd in self.widgets:
                 wd.apply_theme()
             self.save()
+
+    def next_theme(self) -> None:
+        names = list(self.themes)
+        i = names.index(self.theme.name) if self.theme.name in names else -1
+        self.set_theme(names[(i + 1) % len(names)])
+
+    def reload_themes(self) -> None:
+        """Pick up skins added to / edited in the themes folder without restarting."""
+        self.themes = load_themes(self.themes_dir)
+        if self.theme.name not in self.themes:
+            self.theme = self.themes["Luna Blue"]
+        else:
+            self.theme = self.themes[self.theme.name]
+        for wd in self.widgets:
+            wd.apply_theme()
+        self.save()
+
+    def open_themes_folder(self) -> None:
+        ensure_user_dir(self.themes_dir)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.themes_dir)))
+
+    def reset_layout(self) -> None:
+        """Tidy every widget into columns along the right edge of the main screen."""
+        geo = self.app.primaryScreen().availableGeometry()
+        right, y, col_w = geo.right() + 1 - 10, geo.top() + 10, 0
+        for wd in self.widgets:
+            w, h = wd.width(), wd.height()
+            if col_w and y + h > geo.bottom():
+                right -= col_w + 10
+                y, col_w = geo.top() + 10, 0
+            wd.move(max(geo.left() + 10, right - w), y)
+            y += h + 10
+            col_w = max(col_w, w)
+        self.save()
 
     def set_opacity(self, value: float) -> None:
         self.opacity = float(value)
@@ -225,53 +328,31 @@ class Manager:
 
     def set_always_on_top(self, flag: bool) -> None:
         self.always_on_top = bool(flag)
-        for wd in self.widgets:
-            pos, was_visible = wd.pos(), wd.isVisible()
-            wd.setWindowFlag(Qt.WindowStaysOnTopHint, self.always_on_top)
-            wd.move(pos)
-            if was_visible:
-                wd.show()
+        self._reapply_flags()
         self.save()
 
-    # --------------------------------------------------------- real time
-    def now(self) -> dt.datetime:
-        """PC time corrected with the offset learned from the internet."""
-        return dt.datetime.now() + self.time_offset
-
-    def _apply_sync_setting(self) -> None:
-        if self.sync_time:
-            self.timesync.start()
-            self.resync.start()
-        else:
-            self.resync.stop()
-            self.time_offset = dt.timedelta(0)
-            self.time_ok = None
-            self._refresh_all()
-
-    def _on_time_synced(self, offset) -> None:
-        if not self.sync_time:
+    def set_click_through(self, flag: bool) -> None:
+        """Widgets ignore the mouse (clicks go to the game). Needs a way back:
+        the tray icon or the Ctrl+Alt+G hotkey."""
+        flag = bool(flag)
+        if flag and not self.can_escape_click_through():
             return
-        if offset is None:
-            self.time_ok = False          # offline: keep the last known offset
-        else:
-            self.time_offset = dt.timedelta(seconds=offset)
-            self.time_ok = True
-        self._refresh_all()
+        self.click_through = flag
+        self._reapply_flags()
 
-    def _refresh_all(self) -> None:
-        for wd in self.widgets:
-            wd.update()
+    def toggle_click_through(self) -> None:
+        self.set_click_through(not self.click_through)
 
-    def set_sync_time(self, flag: bool) -> None:
-        self.sync_time = bool(flag)
-        self._apply_sync_setting()
+    def set_locked(self, flag: bool) -> None:
+        self.locked = bool(flag)
         self.save()
 
-    def sync_now(self) -> None:
-        if self.sync_time:
-            self.timesync.start()
-        else:
-            self.set_sync_time(True)
+    def set_snap(self, flag: bool) -> None:
+        self.snap = bool(flag)
+        self.save()
+
+    def set_autostart(self, flag: bool) -> None:
+        autostart.set_enabled(bool(flag))
 
     def set_clock24(self, flag: bool) -> None:
         self.clock24 = bool(flag)
@@ -293,9 +374,10 @@ class Manager:
             act = sub.addAction(label)
             act.triggered.connect(lambda _c=False, k=kind: self.new_widget(k))
 
+        registered = getattr(self.hotkey_cleanup, "registered", set())
         label = "Show all widgets" if not self.visible else "Hide all widgets"
-        if self.hotkey_cleanup is not None:
-            label += f"\t{HOTKEY_LABEL}"
+        if "W" in registered:
+            label += f"\t{PREFIX}W"
         act = menu.addAction(label)
         act.triggered.connect(self.toggle_visible)
         menu.addSeparator()
@@ -309,6 +391,19 @@ class Manager:
             act.setChecked(name == self.theme.name)
             group.addAction(act)
             act.triggered.connect(lambda _c=False, n=name: self.set_theme(n))
+        sub.addSeparator()
+        label = "Next skin"
+        if "T" in registered:
+            label += f"\t{PREFIX}T"
+        act = sub.addAction(label)
+        act.triggered.connect(self.next_theme)
+        act = sub.addAction("Reload skins")
+        act.triggered.connect(self.reload_themes)
+        act = sub.addAction("Open skins folder")
+        act.triggered.connect(self.open_themes_folder)
+
+        act = menu.addAction("Reset layout")
+        act.triggered.connect(self.reset_layout)
 
         sub = menu.addMenu("Opacity")
         group = QActionGroup(sub)
@@ -320,29 +415,32 @@ class Manager:
             group.addAction(act)
             act.triggered.connect(lambda _c=False, v=pct / 100.0: self.set_opacity(v))
 
-        for text, value, setter in (
-                ("Always on top", self.always_on_top, self.set_always_on_top),
-                ("24-hour clock", self.clock24, self.set_clock24),
-                ("Time from the internet", self.sync_time, self.set_sync_time),
-                ("Week starts on Monday", self.week_monday, self.set_week_monday)):
+        ct_label = "Click-through (ignore mouse)"
+        if "G" in registered:
+            ct_label += f"\t{PREFIX}G"
+        items = [("Always on top", self.always_on_top, self.set_always_on_top, True),
+                 (ct_label, self.click_through, self.set_click_through,
+                  self.can_escape_click_through()),
+                 ("Lock positions", self.locked, self.set_locked, True),
+                 ("Snap to edges", self.snap, self.set_snap, True),
+                 ("24-hour clock", self.clock24, self.set_clock24, True),
+                 ("Week starts on Monday", self.week_monday, self.set_week_monday, True)]
+        if autostart.supported():
+            items.append(("Start with Windows", autostart.is_enabled(),
+                          self.set_autostart, True))
+        for text, value, setter, enabled in items:
             act = menu.addAction(text)
             act.setCheckable(True)
             act.setChecked(value)
+            act.setEnabled(enabled)
             act.triggered.connect(setter)
-
-        if self.sync_time:
-            if self.time_ok is None:
-                status = "Checking the time..."
-            elif self.time_ok:
-                secs = self.time_offset.total_seconds()
-                status = f"Synced (PC was off by {secs:+.1f} s) - sync now"
-            else:
-                status = "No internet - using PC time - retry"
-            act = menu.addAction(status)
-            act.triggered.connect(self.sync_now)
 
         if widget is not None:
             menu.addSeparator()
+            before = len(menu.actions())
+            widget.extra_menu(menu)
+            if len(menu.actions()) > before:
+                menu.addSeparator()
             act = menu.addAction("Close this widget")
             act.triggered.connect(lambda: self.remove(widget))
         menu.addSeparator()
@@ -367,7 +465,8 @@ class Manager:
             return
         data = {"theme": self.theme.name, "always_on_top": self.always_on_top,
                 "opacity": self.opacity, "clock24": self.clock24,
-                "week_monday": self.week_monday, "sync_time": self.sync_time,
+                "week_monday": self.week_monday, "snap": self.snap,
+                "locked": self.locked,
                 "widgets": [w.to_state() for w in self.widgets]}
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -380,7 +479,6 @@ class Manager:
     def quit(self) -> None:
         self.save()
         self.ticker.stop()
-        self.resync.stop()
         if self.hotkey_cleanup is not None:
             self.hotkey_cleanup()
         if self.tray is not None:

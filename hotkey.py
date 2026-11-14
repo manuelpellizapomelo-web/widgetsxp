@@ -1,18 +1,20 @@
-"""hotkey.py - global hotkey (Ctrl+Alt+W) to hide/show all widgets.
+"""hotkey.py - global hotkeys (Ctrl+Alt+<key>) via the Windows RegisterHotKey API.
 
-Uses the standard Windows RegisterHotKey API: no keyboard hooks, no polling,
-no CPU use while idle. On other systems (or if the key is taken) it simply
-does nothing.
+No keyboard hooks, no polling, no CPU use while idle. On other systems, or if
+a key combination is already taken, it simply does nothing for that key.
 """
 from __future__ import annotations
 
 import sys
 
-HOTKEY_LABEL = "Ctrl+Alt+W"
+PREFIX = "Ctrl+Alt+"
 
 
-def install_hotkey(app, callback):
-    """Returns a cleanup function if the hotkey was registered, else None."""
+def install_hotkeys(app, mapping: dict):
+    """mapping = {"W": callback, "G": callback}.
+
+    Returns a cleanup function (with a .registered set) or None if nothing
+    could be registered."""
     if sys.platform != "win32":
         return None
     try:
@@ -23,9 +25,14 @@ def install_hotkey(app, callback):
 
         user32 = ctypes.windll.user32
         MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
-        WM_HOTKEY, HOTKEY_ID = 0x0312, 0x5932
-        if not user32.RegisterHotKey(None, HOTKEY_ID,
-                                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("W")):
+        WM_HOTKEY = 0x0312
+        ids = {}
+        for key, cb in mapping.items():
+            hid = 0x5900 + ord(key.upper())
+            if user32.RegisterHotKey(None, hid, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                                     ord(key.upper())):
+                ids[hid] = (key.upper(), cb)
+        if not ids:
             return None
 
         class _Filter(QAbstractNativeEventFilter):
@@ -33,8 +40,8 @@ def install_hotkey(app, callback):
                 try:
                     if bytes(event_type) == b"windows_generic_MSG":
                         msg = wintypes.MSG.from_address(int(message))
-                        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                            QTimer.singleShot(0, callback)
+                        if msg.message == WM_HOTKEY and msg.wParam in ids:
+                            QTimer.singleShot(0, ids[msg.wParam][1])
                 except Exception:
                     pass
                 return False, 0
@@ -44,12 +51,14 @@ def install_hotkey(app, callback):
 
         def cleanup():
             try:
-                user32.UnregisterHotKey(None, HOTKEY_ID)
+                for hid in ids:
+                    user32.UnregisterHotKey(None, hid)
                 app.removeNativeEventFilter(flt)
             except Exception:
                 pass
 
-        cleanup.filter = flt          # keep the filter object alive
+        cleanup.filter = flt                      # keep the filter object alive
+        cleanup.registered = {k for k, _ in ids.values()}
         return cleanup
     except Exception:
         return None

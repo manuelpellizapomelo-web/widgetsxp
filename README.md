@@ -1,3 +1,5 @@
+If you find this tool useful, you can support its development on [Ko-fi](https://ko-fi.com/mitio98).
+
 Widgets: your desktop, but make it 2001.
 Widgets puts the Windows XP look back on your screen with small, draggable widgets: an analog and digital clock, a calendar, a CPU/RAM/network monitor, a timer and stopwatch, and auto-saved notes.
 
